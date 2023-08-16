@@ -1,0 +1,15 @@
+# Other
+.DS_Store
+wandb
+__pycache__
+.ipynb_checkpoints
+
+# Log
+*.log
+*.log.*
+*.json
+
+# Data
+*.pkl
+*.csv
+checkpoints
