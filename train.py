@@ -19,7 +19,7 @@ from data.prepare import preprocess
 # Hyperparameters
 @dataclass
 class TrainingArguments:
-    batch_size: int = 1
+    batch_size: int = 2
     max_iters: int = 10000
     eval_interval: int = 500
     eval_iters: int = 100
@@ -30,7 +30,7 @@ class TrainingArguments:
         False  # if True, always save a checkpoint after each eval
     )
     init_from: str = "scratch"  # mode of training -- 'scratch','resume'
-    out_dir: str = "test-llm-checkpoints"
+    out_dir: str = "llm-checkpoints"
 
     # System
     device: str = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -60,7 +60,7 @@ class TrainingArguments:
     tokenizer_path: str = "meta-llama/Llama-2-7b-chat-hf"
 
     # Wandb log
-    wandb_log = False  # disabled by default
+    wandb_log = True  # disabled by default
     wandb_project = "mvuthegoat"
     wandb_run_name = "minivnGPT"  # 'run' + str(time.time())
 
