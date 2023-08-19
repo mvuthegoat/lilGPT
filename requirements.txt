@@ -3,3 +3,7 @@ numpy  # train.py dataset memmap
 datasets  # evaluate.py
 transformers
 tqdm
+
+# Formatting
+pylint
+black
