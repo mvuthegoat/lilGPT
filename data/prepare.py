@@ -15,7 +15,7 @@ def preprocess(
         data,
     ).input_ids
 
-    # Split train/test. Default split is 0.90
+    # Split train/test. Default split is 0.95
     np.random.seed(0)
     perm = np.random.permutation(len(input_ids))
     split = int(len(perm) * 0.95)
