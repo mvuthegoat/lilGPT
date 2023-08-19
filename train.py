@@ -5,6 +5,7 @@ import math
 import pickle
 from contextlib import nullcontext
 from dataclasses import dataclass
+from tqdm import tqdm
 
 import torch
 import transformers
@@ -18,7 +19,7 @@ from data.prepare import preprocess
 # Hyperparameters
 @dataclass
 class TrainingArguments:
-    batch_size: int = 2
+    batch_size: int = 1
     max_iters: int = 10000
     eval_interval: int = 500
     eval_iters: int = 100
@@ -29,7 +30,7 @@ class TrainingArguments:
         False  # if True, always save a checkpoint after each eval
     )
     init_from: str = "scratch"  # mode of training -- 'scratch','resume'
-    out_dir: str = "llm-checkpoints"
+    out_dir: str = "test-llm-checkpoints"
 
     # System
     device: str = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -59,7 +60,7 @@ class TrainingArguments:
     tokenizer_path: str = "meta-llama/Llama-2-7b-chat-hf"
 
     # Wandb log
-    wandb_log = True  # disabled by default
+    wandb_log = False  # disabled by default
     wandb_project = "mvuthegoat"
     wandb_run_name = "minivnGPT"  # 'run' + str(time.time())
 
@@ -136,7 +137,7 @@ def train():
     print(f"Tokens per iteration will be: {tokens_per_iter:,}")
 
     # init these up here, can override if init_from='resume' (i.e. resume training from a checkpoint)
-    iter_num = 0
+    iter_num_start = 0
     best_val_loss = 1e9
 
     if training_args.init_from == "scratch":
@@ -173,7 +174,7 @@ def train():
         # Load state dict to model
         model.load_state_dict(state_dict)
 
-        iter_num = checkpoint["iter_num"]
+        iter_num_start = checkpoint["iter_num"]
         best_val_loss = checkpoint["best_val_loss"]
 
     model.to(training_args.device)
@@ -285,8 +286,9 @@ def train():
     raw_model = model.module if ddp else model  # unwrap DDP container if needed
 
     # Training loop
-    while True:
+    for iter_num in tqdm(range(iter_num_start, training_args.max_iters)):
         # determine and set the learning rate for this iteration
+
         lr = get_lr(iter_num) if training_args.decay_lr else training_args.learning_rate
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
@@ -363,7 +365,6 @@ def train():
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
             lossf = loss.item() * training_args.gradient_accumulation_steps
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
-        iter_num += 1
 
         # termination conditions
         if iter_num > training_args.max_iters:
