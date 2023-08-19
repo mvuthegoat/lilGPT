@@ -21,7 +21,7 @@ jobs:
         pip install pylint black
     - name: Analysing the code with pylint
       run: |
-        pylint --enable=E0602 $(git ls-files '*.py')
+        pylint -d all -e E0602 $(git ls-files '*.py')
     - name: Check formatting with black
       run: |
         black --check .
