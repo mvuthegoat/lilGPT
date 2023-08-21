@@ -26,9 +26,6 @@ class TrainingArguments:
     log_interval: int = 50
     learning_rate: float = 3e-4
     gradient_accumulation_steps: int = 12  # used to simulate larger batch sizes
-    always_save_checkpoint: bool = (
-        False  # if True, always save a checkpoint after each eval
-    )
     init_from: str = "scratch"  # mode of training -- 'scratch','resume'
     out_dir: str = "llm-checkpoints"
 
@@ -60,7 +57,7 @@ class TrainingArguments:
     tokenizer_path: str = "meta-llama/Llama-2-7b-chat-hf"
 
     # Wandb log
-    wandb_log = True  # disabled by default
+    wandb_log = False  # disabled by default
     wandb_project = "mvuthegoat"
     wandb_run_name = "minivnGPT"  # 'run' + str(time.time())
 
@@ -307,22 +304,32 @@ def train():
                         "lr": lr,
                     }
                 )
-            # Save checkpoint after every eval_interval (same as epoch) if the loss is minimum or always save checkpoint in on
-            if losses["val"] < best_val_loss or training_args.always_save_checkpoint:
+            # Save checkpoint after every eval_interval
+            best_ckpt = False
+            if losses["val"] < best_val_loss:
                 best_val_loss = losses["val"]
-                if iter_num > 0:
-                    # checkpoint contains these params
-                    checkpoint = {
-                        "model": raw_model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "model_args": model_args,
-                        "iter_num": iter_num,
-                        "val_loss": losses["val"],
-                        "best_val_loss": best_val_loss,
-                    }
-                    print(f"saving checkpoint to {training_args.out_dir}")
+                best_ckpt = True
+            if iter_num > 0:
+                # checkpoint contains these params
+                checkpoint = {
+                    "model": raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "model_args": model_args,
+                    "iter_num": iter_num,
+                    "val_loss": losses["val"],
+                    "best_val_loss": best_val_loss,
+                }
+                if best_ckpt:
+                    print(f"Saving best checkpoint to {training_args.out_dir}")
                     torch.save(
-                        checkpoint, os.path.join(training_args.out_dir, "ckpt.pt")
+                        checkpoint,
+                        os.path.join(training_args.out_dir, f"ckpt-{iter_num}-best.pt"),
+                    )
+                else:
+                    print(f"Saving checkpoint to {training_args.out_dir}")
+                    torch.save(
+                        checkpoint,
+                        os.path.join(training_args.out_dir, f"ckpt-{iter_num}.pt"),
                     )
 
         # forward backward update, with optional gradient accumulation to simulate larger batch size
