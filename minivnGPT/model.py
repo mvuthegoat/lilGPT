@@ -8,45 +8,49 @@ from torch.nn import (
 from dataclasses import dataclass
 from typing import Optional, Union, Tuple
 
-torch.manual_seed(10)
 
+def precompute_freqs_cis(d_model: int, pos: int, theta: float = 10000.0):
+    """Compute frequencies in complex form (cis(x) = cos(x) + isin(x) = e^ix)"""
 
-def get_angles(pos, k, d_model):
-    """
-    Get the angles for the positional encoding
-    Arguments:
-        pos -- Column vector containing the positions [[0], [1], ...,[N-1]]. Shape: (pos, 1)
-        k --   Row vector containing the dimension span [[0, 1, 2, ..., d_model-1]]. Shape (d_model, 1)
-        d_model(integer) -- embedding dim
-    Returns:
-        angles -- (pos, d_model) numpy array
-    """
-    i = k // 2  # (1, d_model)
-    angles = pos / np.power(10000, 2 * i / d_model)  # (pos, d_model)
-    return angles
-
-
-def positional_encoding(positions, d_model):
-    """
-    Precomputes a matrix with all the positional encodings
-    Arguments:
-        positions (int) -- Maximum number of positions to be encoded = context_length = number of time steps
-        d_model (int) -- embedding dim (encoding size)
-    Returns:
-        pos_encoding -- (1, position, d_model) A matrix with the positional encodings
-    """
-    # Get the angles
-    angle_rads = get_angles(
-        np.arange(positions)[:, np.newaxis], np.arange(d_model)[np.newaxis, :], d_model
+    # Faster way to calculate the original position embedding function
+    freqs = 1.0 / (
+        theta ** (torch.arange(0, d_model, 2)[: (d_model // 2)].float() / d_model)
     )
-    # Use sine and cosine of different functions
-    angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
-    angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+    t = torch.arange(pos, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()  # same as pos/10000^(2i/d_model)
 
-    pos_encoding = angle_rads[np.newaxis, ...]  # (1, T, C)
-    return torch.from_numpy(pos_encoding).type(
-        torch.float32
-    )  # (position, d_model) = (T, C)
+    # Convert to complex form using the cis(x) formula
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    """Ensure freqs_cis has the proper shape for broadcasting when perform element-wise operations"""
+
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    # x has shape (bs, context_length, d_model), freqs_cis has shape (context_length, d_model)
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [
+        d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)
+    ]  # only preserve some dimensions, others are set to 1
+    return freqs_cis.view(*shape)
+
+
+def apply_rotary_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rotary Position Embedding"""
+
+    q_ = torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
+    k_ = torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, q_)
+    # flatten the tensor in the 2 dimension (the imaginary part)
+    q_out = torch.view_as_real(q_ * freqs_cis).flatten(2)
+    k_out = torch.view_as_real(k_ * freqs_cis).flatten(2)
+    return q_out.type_as(q), k_out.type_as(k)
 
 
 class Head(nn.Module):
@@ -66,10 +70,16 @@ class Head(nn.Module):
         )  # Save trill as the model's attribute
         self.dropout = nn.Dropout(config.dropout_rate)
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
         q = self.query(x)
         k = self.key(x)
         v = self.value(x)
+
+        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)
 
         B, T, C = q.shape
         # Here, C is dk (dimension of key,value,query)
@@ -100,10 +110,14 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(config.d_model, config.d_model)
         self.dropout = nn.Dropout(config.dropout_rate)
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
         # Concatenate all heads from the self.heads list along the channel dimension (last dimension)
         concat = torch.cat(
-            [h(x) for h in self.heads], dim=-1
+            [h.forward(x, freqs_cis) for h in self.heads], dim=-1
         )  # (B, T, d_k * n_head) = (B, T, d_model)
         # Apply projection/ linear transformation to this concat
         out = self.proj(concat)  # (B, T, d_model)
@@ -140,10 +154,10 @@ class Block(nn.Module):
         self.layernorm2 = nn.LayerNorm(config.d_model)
         self.dropout = nn.Dropout(config.dropout_rate)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
         # Slight deviation from original paper: layernorm is applied before going through mha or ffn
-        x = x + self.mha(
-            self.layernorm1(x)
+        x = x + self.mha.forward(
+            self.layernorm1(x), freqs_cis
         )  # We add the previous term because of residual/skip connection -> optimize training
         x = x + self.ffn(self.layernorm2(x))
         x = self.dropout(x)
@@ -174,28 +188,27 @@ class minivnGPT(nn.Module):
         self.config = config
 
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        # self.pos_encoding = positional_encoding(context_length, d_model) (context_length specified here might be different from the input's context length)
-        self.decoder_layers = nn.Sequential(
-            *[Block(self.config) for _ in range(config.n_layer)]
+        self.freqs_cis = precompute_freqs_cis(
+            self.config.d_model // self.config.n_head, self.config.context_length
         )
+        # self.pos_encoding = positional_encoding(context_length, d_model) (context_length specified here might be different from the input's context length)
+        self.decoder_layers = nn.ModuleList()
+        for _ in range(self.config.n_layer):
+            self.decoder_layers.append(Block(self.config))
+
         self.layernorm_final = nn.LayerNorm(config.d_model)
         self.linear_final = nn.Linear(config.d_model, config.vocab_size)
 
-    def forward(self, x, targets=None):
+    def forward(self, x: torch.Tensor, targets=None):
         # Initially, x has shape (B, T)
-        # encode both the embedding and position
+        # encode both the token and position embeddings
         device = x.device
-        token_emb = self.embedding(x)
-        position_emb = positional_encoding(
-            x.shape[1], self.config.d_model
-        )  # x.shape[1] is the context_length of input
-        position_emb = torch.tensor(position_emb, device=device)
-        x = (
-            token_emb + position_emb
-        )  # pos_encoding has shape (T, d_model). self.embedding(x) has shape (B, T, d_model). So, pos_encoding will be broadcasted
-        # x now has shape (B, T, d_model)
+        x = self.embedding(x)
+        self.freqs_cis = self.freqs_cis.to(x.device)
 
-        x = self.decoder_layers(x)  # (B, T, d_model)
+        for layer in self.decoder_layers:
+            x = layer(x, self.freqs_cis)  # (B, T, d_model)
+
         x = self.layernorm_final(x)  # (B, T, d_model)
 
         logits = self.linear_final(x)  # (B, T, vocab_size)
@@ -212,7 +225,11 @@ class minivnGPT(nn.Module):
 
         return logits, loss
 
-    def generate(self, x, max_new_tokens):
+    def generate(
+        self,
+        x,
+        max_new_tokens,
+    ):
         # Generate each new token until max_new_token is reached
         for _ in range(max_new_tokens):
             # length of input must be equal to context_length -> truncate
