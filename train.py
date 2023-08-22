@@ -2,7 +2,9 @@ import os
 import numpy as np
 import time
 import math
-import pickle
+import re
+import glob
+from pathlib import Path
 from contextlib import nullcontext
 from dataclasses import dataclass
 from tqdm import tqdm
@@ -26,6 +28,8 @@ class TrainingArguments:
     log_interval: int = 50
     learning_rate: float = 3e-4
     gradient_accumulation_steps: int = 12  # used to simulate larger batch sizes
+    save_total_limit: int = 1  # total number of checkpoints to save
+    save_best_checkpoint: bool = True  # whether to save the best val checkpoint
     init_from: str = "scratch"  # mode of training -- 'scratch','resume'
     out_dir: str = "llm-checkpoints"
 
@@ -60,6 +64,33 @@ class TrainingArguments:
     wandb_log = False  # disabled by default
     wandb_project = "mvuthegoat"
     wandb_run_name = "minivnGPT"  # 'run' + str(time.time())
+
+
+def process_checkpoints(output_dir=None, checkpoint_prefix="ckpt", save_total_limit=0):
+    ordering_and_checkpoint_path = []
+
+    glob_checkpoints = [
+        str(x)
+        for x in Path(output_dir).glob(f"{checkpoint_prefix}-*")
+        if os.path.exists(x)
+    ]
+    for path in glob_checkpoints:
+        regex_match = re.match(f".*{checkpoint_prefix}-([0-9]+)", path)
+        if regex_match is not None and regex_match.groups() is not None:
+            ordering_and_checkpoint_path.append((int(regex_match.groups()[0]), path))
+
+    checkpoints_sorted = sorted(ordering_and_checkpoint_path)
+    checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
+
+    if save_total_limit <= 0 or len(checkpoints_sorted) <= save_total_limit:
+        return
+
+    number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - save_total_limit)
+    checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
+    # Deleting checkpoints
+    for checkpoint in checkpoints_to_be_deleted:
+        # the checkpoint is a single file, not a directory -> use os.remove() instead of shutil.rmtree()
+        os.remove(checkpoint)
 
 
 def train():
@@ -305,8 +336,8 @@ def train():
                     }
                 )
             # Save checkpoint after every eval_interval
-            best_ckpt = False
-            if losses["val"] < best_val_loss:
+            best_ckpt = None
+            if training_args.save_best_checkpoint and losses["val"] < best_val_loss:
                 best_val_loss = losses["val"]
                 best_ckpt = True
             if iter_num > 0:
@@ -323,13 +354,23 @@ def train():
                     print(f"Saving best checkpoint to {training_args.out_dir}")
                     torch.save(
                         checkpoint,
-                        os.path.join(training_args.out_dir, f"ckpt-{iter_num}-best.pt"),
+                        os.path.join(training_args.out_dir, f"ckpt-best-{iter_num}.pt"),
+                    )
+                    process_checkpoints(
+                        output_dir=training_args.out_dir,
+                        checkpoint_prefix="ckpt-best",
+                        save_total_limit=1,
                     )
                 else:
                     print(f"Saving checkpoint to {training_args.out_dir}")
                     torch.save(
                         checkpoint,
                         os.path.join(training_args.out_dir, f"ckpt-{iter_num}.pt"),
+                    )
+                    process_checkpoints(
+                        output_dir=training_args.out_dir,
+                        checkpoint_prefix="ckpt",
+                        save_total_limit=training_args.save_total_limit,
                     )
 
         # forward backward update, with optional gradient accumulation to simulate larger batch size
