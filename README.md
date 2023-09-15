@@ -1,2 +1,2 @@
-# minivnGPT
-a mini language model from scratch
+# lilGPT
+a little language model from scratch
