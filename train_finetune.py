@@ -1,114 +1,220 @@
-import os
-import numpy as np
-import time
-import math
-import re
-import glob
-from pathlib import Path
-from contextlib import nullcontext
-from datetime import datetime
-from dataclasses import dataclass
-from tqdm import tqdm
-from functools import partial
+# This code is based on tatsu-lab/stanford_alpaca. Below is the original copyright:
+#
+#    Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
 
+from dataclasses import dataclass, field
+import json
+import math
+import pathlib
+from typing import Dict, Optional, Sequence
+
+import numpy as np
 import torch
+from torch.utils.data import Dataset
+import transformers
+from transformers import Trainer
+from transformers.trainer_pt_utils import LabelSmoother
+
+from fastchat.conversation import SeparatorStyle
+from fastchat.model.model_adapter import get_conversation_template
+
+from tokenizer import Tokenizer
+
+# Training
+import os
+import time
+
 from model import Transformer, ModelArgs
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+from train import TrainingArgs, process_checkpoints
+from pathlib import Path
+from contextlib import nullcontext
+from datetime import datetime
+from tqdm import tqdm
+from functools import partial
 
-from tinystories import Task
+IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+# IGNORE_TOKEN_ID = 0
 
 
-# Hyperparameters
 @dataclass
-class TrainingArgs:
-    # Data
-    max_batch_size: int = 2
-    max_seq_len: int = 2048
-    vocab_source: str = (
-        "llama2"  # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
+class ModelArguments:
+    checkpoint: Optional[str] = field(default="little-checkpoints/ckpt-best-98500.pt")
+
+
+@dataclass
+class DataArgs:
+    data_path: str = field(
+        default="data/clean_alpaca_data.json",
+        metadata={"help": "Path to the training data."},
     )
-    vocab_size: int = 32000  # the Llama 2 tokenizer has 32K tokens
-
-    # I/O
-    eval_interval: int = 500
-    eval_iters: int = 100
-    log_interval: int = 50
-    save_total_limit: int = 1  # total number of checkpoints to save
-    save_best_checkpoint: bool = True  # whether to save the best val checkpoint
-    init_from: str = "scratch"  # mode of training -- 'scratch','resume'
-    out_dir: str = "little-checkpoints"
-
-    # Model
-    dim: int = 768
-    n_layers: int = 12
-    n_heads: int = 12
-    n_kv_heads: int = 12
-    multiple_of: int = 32
-    dropout: float = 0.0
-
-    # System
-    device: str = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-    dtype: str = (
-        "bfloat16"
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-        else "float16"
-    )  # 'float32', 'bfloat16', or 'float16' (float16 will auto implement a GradScaler)
-    compile: bool = False
-
-    # DDP Settings
-    backend: str = "nccl"  # 'nccl', 'gloo', etc.
-
-    # Learning rate decay settings
-    decay_lr: bool = True
-    warmup_iters: int = 2000
-    lr_decay_iters: int = 100000
-    min_lr: float = 3e-5
-
-    # Optimizer settings
-    gradient_accumulation_steps: int = 12  # used to simulate larger batch sizes
-    learning_rate: float = 3e-4
-    max_iters: int = 100000
-    weight_decay: float = 1e-1
-    beta1: float = 0.9
-    beta2: float = 0.95
-    grad_clip: float = 0.0
-
-    # Wandb log
-    wandb_log: bool = True  # disabled by default
-    wandb_project: str = "llm"
-    wandb_run_name: str = "lilGPT"  # 'run' + str(time.time())
+    eval_data_path: str = field(
+        default=None, metadata={"help": "Path to the evaluation data."}
+    )
+    lazy_preprocess: bool = False
 
 
-def process_checkpoints(output_dir=None, checkpoint_prefix="ckpt", save_total_limit=0):
-    ordering_and_checkpoint_path = []
+local_rank = None
 
-    glob_checkpoints = [
-        str(x)
-        for x in Path(output_dir).glob(f"{checkpoint_prefix}-*")
-        if os.path.exists(x)
-    ]
-    for path in glob_checkpoints:
-        regex_match = re.match(f".*{checkpoint_prefix}-([0-9]+)", path)
-        if regex_match is not None and regex_match.groups() is not None:
-            ordering_and_checkpoint_path.append((int(regex_match.groups()[0]), path))
 
-    checkpoints_sorted = sorted(ordering_and_checkpoint_path)
-    checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
+def rank0_print(*args):
+    if local_rank == 0:
+        print(*args)
 
-    if save_total_limit <= 0 or len(checkpoints_sorted) <= save_total_limit:
-        return
 
-    number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - save_total_limit)
-    checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
-    # Deleting checkpoints
-    for checkpoint in checkpoints_to_be_deleted:
-        # the checkpoint is a single file, not a directory -> use os.remove() instead of shutil.rmtree()
-        os.remove(checkpoint)
+def preprocess(
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+) -> Dict:
+    conv = get_conversation_template("vicuna")
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+    # Apply prompt templates
+    conversations = []
+    for i, source in enumerate(sources):
+        if roles[source[0]["from"]] != conv.roles[0]:
+            # Skip the first one if it is not from human
+            source = source[1:]
+
+        conv.messages = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            assert role == conv.roles[j % 2], f"{i}"
+            conv.append_message(role, sentence["value"])
+        conversations.append(conv.get_prompt())
+
+    # Tokenize conversations
+    input_ids = tokenizer(
+        conversations,
+        return_tensors="pt",
+        padding="max_length",
+        max_length=2048,
+        truncation=True,
+    ).input_ids
+    targets = input_ids.clone()
+
+    assert conv.sep_style == SeparatorStyle.ADD_COLON_TWO
+
+    # Mask targets. Only compute loss on the assistant outputs.
+    sep = conv.sep + conv.roles[1] + ": "
+    for conversation, target in zip(conversations, targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+
+        turns = conversation.split(conv.sep2)
+        cur_len = 1
+        target[:cur_len] = IGNORE_TOKEN_ID
+        for i, turn in enumerate(turns):
+            if turn == "":
+                break
+            turn_len = len(tokenizer(turn).input_ids)
+
+            parts = turn.split(sep)
+            if len(parts) != 2:
+                break
+            parts[0] += sep
+            # "-2" is hardcoded for the LLaMA tokenizer to make the offset correct.
+            instruction_len = len(tokenizer(parts[0]).input_ids) - 2
+
+            # Ignore the user instructions
+            target[cur_len : cur_len + instruction_len] = IGNORE_TOKEN_ID
+            cur_len += turn_len
+
+        target[cur_len:] = IGNORE_TOKEN_ID
+
+        if False:  # Inspect and check the correctness of masking
+            z = target.clone()
+            z = torch.where(z == IGNORE_TOKEN_ID, tokenizer.unk_token_id, z)
+            rank0_print(tokenizer.decode(z))
+
+        if cur_len < tokenizer.model_max_length:
+            if cur_len != total_len:
+                target[:] = IGNORE_TOKEN_ID
+                rank0_print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
+                    f" (ignored)"
+                )
+
+    return dict(
+        input_ids=input_ids,
+        labels=targets,
+    )
+
+
+class PretokDataset(torch.utils.data.IterableDataset):
+    """Loads pretokenized examples from disk and yields them as PyTorch tensors."""
+
+    def __init__(self, data_path, split, tokenizer: transformers.PreTrainedTokenizer):
+        super().__init__()
+
+        rank0_print("Formatting inputs...")
+        raw_data = json.load(open(data_path, "r"))
+        sources = [example["conversations"] for example in raw_data]
+        data_dict = preprocess(sources, tokenizer)
+
+        self.input_ids = data_dict["input_ids"]
+        self.labels = data_dict["labels"]
+
+        self.split = split
+
+    def __iter__(self):
+        # train/test split
+        # np.random.seed(0)
+        # perm = np.random.permutation(len(self.input_ids))
+        perm = np.arange(len(self.input_ids))
+        split = int(len(perm) * 0.98)
+        train_indices = perm[:split]
+        eval_indices = perm[split:]
+
+        indices = train_indices if self.split == "train" else eval_indices
+
+        while True:
+            for i in indices:
+                x = self.input_ids[i]
+                y = self.labels[i]
+
+                yield x, y
+
+
+class Task:
+    @staticmethod
+    def iter_batches(batch_size, device, num_workers=0, **dataset_kwargs):
+        rank0_print("Loading data...")
+        ds = PretokDataset(**dataset_kwargs)
+        dl = torch.utils.data.DataLoader(
+            ds, batch_size=batch_size, pin_memory=True, num_workers=num_workers
+        )
+        for x, y in dl:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            yield x, y
 
 
 def train():
-    training_args = TrainingArgs()
+    training_args = TrainingArgs(
+        out_dir="finetune_ckpt", wandb_log=False, init_from="resume"
+    )
+    data_args = DataArgs()
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path="meta-llama/Llama-2-7b-chat-hf",
+        model_max_length=training_args.max_seq_len,
+        padding_side="right",
+        use_fast=False,
+    )
+    tokenizer.pad_token = tokenizer.unk_token
 
     assert training_args.vocab_source in ["llama2", "custom"]
     assert (
@@ -190,11 +296,10 @@ def train():
     iter_batches = partial(
         Task.iter_batches,
         batch_size=training_args.max_batch_size,
-        max_seq_len=training_args.max_seq_len,
-        vocab_size=training_args.vocab_size,
-        vocab_source=training_args.vocab_source,
         device=training_args.device,
         num_workers=0,
+        data_path=data_args.data_path,
+        tokenizer=tokenizer,
     )
 
     # init these up here, can override if init_from='resume' (i.e. resume training from a checkpoint)
@@ -216,12 +321,22 @@ def train():
 
     if training_args.init_from == "scratch":
         print("Initialize a new model from scratch")
-        gptconf = ModelArgs(**model_args)
+
+        # init from a model saved in a specific directory
+        checkpoint = "little-checkpoints/ckpt-best-98500.pt"
+        checkpoint_dict = torch.load(checkpoint, map_location=training_args.device)
+        gptconf = ModelArgs(**checkpoint_dict["model_args"])
         model = Transformer(gptconf)
+        state_dict = checkpoint_dict["model"]
+        unwanted_prefix = "_orig_mod."
+        for k, v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+        model.load_state_dict(state_dict, strict=False)
     elif training_args.init_from == "resume":
         # resume training from checkpoint
         print(f"Resume training from {training_args.out_dir}")
-        ckpt_path = os.path.join(training_args.out_dir, "ckpt-31500.pt")
+        ckpt_path = os.path.join(training_args.out_dir, "ckpt-best-1000.pt")
         checkpoint = torch.load(ckpt_path, map_location=training_args.device)
         checkpoint_model_args = checkpoint["model_args"]
         # force these config attributes to be equal otherwise we can't even resume training

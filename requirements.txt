@@ -1,9 +1,6 @@
 torch
-numpy  # train.py dataset memmap
-datasets  # evaluate.py
-transformers
+numpy
+transformers>=4.31.0
 tqdm
-
-# Formatting
-pylint
-black
+wandb
+sentencepiece

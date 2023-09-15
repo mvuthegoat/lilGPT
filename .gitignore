@@ -9,7 +9,10 @@ __pycache__
 *.log.*
 *.json
 
+# Checkpoints
+*.pt
+
 # Data
 *.pkl
 *.csv
-checkpoints
+data
